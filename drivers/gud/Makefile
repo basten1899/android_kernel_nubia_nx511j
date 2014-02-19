@@ -20,7 +20,7 @@ mcKernelApi-objs := MobiCoreKernelApi/main.o \
 		MobiCoreKernelApi/connection.o
 
 # Release mode by default
-ccflags-y := -DNDEBUG -I$(GUD_ROOT_FOLDER)
+ccflags-y := -DNDEBUG -I$(GUD_ROOT_FOLDER)/build_tag.h
 ccflags-y += -Wno-declaration-after-statement
 
 #Netlink changed arguments number
