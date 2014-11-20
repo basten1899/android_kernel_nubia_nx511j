@@ -943,7 +943,7 @@ static long nfc_compat_ioctl(struct file *pfile, unsigned int cmd,
 	arg = (compat_u64)arg;
 	switch (cmd) {
 	case NFC_SET_PWR:
-		nfc_ioctl_power_states(pfile, cmd, arg);
+		r = nfc_ioctl_power_states(pfile, cmd, arg);
 		break;
 	case NFCC_MODE:
 		nfc_ioctl_nfcc_mode(pfile, cmd, arg);
