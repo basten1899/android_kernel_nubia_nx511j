@@ -462,17 +462,18 @@ static void hdd_wdi_trace_enable(wpt_moduleid moduleId, v_U32_t bitmask)
  */
 int wlan_hdd_validate_context(hdd_context_t *pHddCtx)
 {
+    ENTER();
 
     if (NULL == pHddCtx || NULL == pHddCtx->cfg_ini)
     {
-        VOS_TRACE( VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_INFO,
+        VOS_TRACE( VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
                 "%s: HDD context is Null", __func__);
         return -ENODEV;
     }
 
     if (pHddCtx->isLogpInProgress)
     {
-        VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_INFO,
+        VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
                   "%s: LOGP %s. Ignore!!", __func__,
                     vos_is_wlan_in_badState(VOS_MODULE_ID_HDD, NULL)
                     ?"failed":"in Progress");
@@ -481,7 +482,7 @@ int wlan_hdd_validate_context(hdd_context_t *pHddCtx)
 
     if (WLAN_HDD_IS_LOAD_UNLOAD_IN_PROGRESS(pHddCtx))
     {
-        VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_INFO,
+        VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
                   "%s: Unloading/Loading in Progress. Ignore!!!", __func__);
         return -EAGAIN;
     }
@@ -4264,6 +4265,8 @@ int __hdd_ioctl(struct net_device *dev, struct ifreq *ifr, int cmd)
    pHddCtx = WLAN_HDD_GET_CTX(pAdapter);
    ret = wlan_hdd_validate_context(pHddCtx);
    if (ret) {
+      VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_INFO,
+                "%s: invalid context", __func__);
       ret = -EBUSY;
       goto exit;
    }
@@ -5809,7 +5812,18 @@ void wlan_hdd_release_intf_addr(hdd_context_t* pHddCtx, tANI_U8* releaseAddr)
       .ndo_do_ioctl = hdd_ioctl,
       .ndo_set_mac_address = hdd_set_mac_address,
  };
-
+ static struct net_device_ops nullify_netdev_ops = {
+      .ndo_open = NULL,
+      .ndo_stop = NULL,
+      .ndo_uninit = NULL,
+      .ndo_start_xmit = NULL,
+      .ndo_tx_timeout = NULL,
+      .ndo_get_stats = NULL,
+      .ndo_set_mac_address = NULL,
+      .ndo_do_ioctl = NULL,
+      .ndo_change_mtu = NULL,
+      .ndo_select_queue = NULL,
+ };
 #endif
 
 void hdd_set_station_ops( struct net_device *pWlanDev )
@@ -7901,15 +7915,6 @@ void hdd_wlan_exit(hdd_context_t *pHddCtx)
          pAdapter = pAdapterNode->pAdapter;
          if (NULL != pAdapter)
          {
-            /* Disable TX on the interface, after this hard_start_xmit() will
-             * not be called on that interface
-             */
-            hddLog(VOS_TRACE_LEVEL_INFO, FL("Disabling queues"));
-            netif_tx_disable(pAdapter->dev);
-
-            /* Mark the interface status as "down" for outside world */
-            netif_carrier_off(pAdapter->dev);
-
             /* DeInit the adapter. This ensures that all data packets
              * are freed.
              */
@@ -7959,19 +7964,6 @@ void hdd_wlan_exit(hdd_context_t *pHddCtx)
    else
    {
       hddLog(VOS_TRACE_LEVEL_INFO,"%s: FTM MODE",__func__);
-      if (pHddCtx->ftm.ftm_state == WLAN_FTM_STARTING)
-      {
-         INIT_COMPLETION(pHddCtx->ftm.startCmpVar);
-         VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_INFO,
-              "%s: in middle of FTM START", __func__);
-         lrc = wait_for_completion_timeout(&pHddCtx->ftm.startCmpVar,
-                                          msecs_to_jiffies(20000));
-         if(!lrc)
-         {
-              VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_FATAL,
-              "%s: timedout on ftmStartCmpVar fatal error", __func__);
-         }
-      }
       wlan_hdd_ftm_close(pHddCtx);
       goto free_hdd_ctx;
    }
@@ -9524,6 +9516,9 @@ static int hdd_driver_init( void)
 #ifdef HAVE_WCNSS_CAL_DOWNLOAD
    int max_retries = 0;
 #endif
+#ifdef HAVE_CBC_DONE
+   int max_cbc_retries = 0;
+#endif
 
 #ifdef WLAN_LOGGING_SOCK_SVC_ENABLE
    wlan_logging_sock_init_svc();
@@ -9552,6 +9547,7 @@ static int hdd_driver_init( void)
    while (!wcnss_device_ready() && 5 >= ++max_retries) {
        msleep(1000);
    }
+
    if (max_retries >= 5) {
       hddLog(VOS_TRACE_LEVEL_FATAL,"%s: WCNSS driver not ready", __func__);
 #ifdef WLAN_OPEN_SOURCE
@@ -9563,6 +9559,15 @@ static int hdd_driver_init( void)
 #endif
 
       return -ENODEV;
+   }
+#endif
+
+#ifdef HAVE_CBC_DONE
+   while (!wcnss_cbc_complete() && 10 >= ++max_cbc_retries) {
+       msleep(1000);
+   }
+   if (max_cbc_retries >= 10) {
+      hddLog(VOS_TRACE_LEVEL_FATAL, "%s:CBC not completed", __func__);
    }
 #endif
 
@@ -9682,8 +9687,10 @@ static void hdd_driver_exit(void)
 {
    hdd_context_t *pHddCtx = NULL;
    v_CONTEXT_t pVosContext = NULL;
+   pVosWatchdogContext pVosWDCtx = NULL;
    v_REGDOMAIN_t regId;
    unsigned long rc = 0;
+   unsigned long flags;
 
    pr_info("%s: unloading driver v%s\n", WLAN_MODULE_NAME, QWLAN_VERSIONSTR);
 
@@ -9699,18 +9706,40 @@ static void hdd_driver_exit(void)
    //Get the HDD context.
    pHddCtx = (hdd_context_t *)vos_get_context(VOS_MODULE_ID_HDD, pVosContext );
 
-   if (!pHddCtx)
+   if(!pHddCtx)
    {
-       hddLog(VOS_TRACE_LEVEL_FATAL,"%s: module exit called before probe",__func__);
+      hddLog(VOS_TRACE_LEVEL_FATAL,"%s: module exit called before probe",__func__);
    }
    else
    {
-      INIT_COMPLETION(pHddCtx->ssr_comp_var);
-      if ((pHddCtx->isLogpInProgress) && (FALSE ==
-                  vos_is_wlan_in_badState(VOS_MODULE_ID_HDD, NULL)))
+      pVosWDCtx = get_vos_watchdog_ctxt();
+      if(pVosWDCtx == NULL)
       {
+         hddLog(VOS_TRACE_LEVEL_ERROR, FL("WD context is invalid"));
+         goto done;
+      }
+      rtnl_lock();
+      hdd_nullify_netdev_ops(pHddCtx);
+      rtnl_unlock();
+      spin_lock_irqsave(&pVosWDCtx->wdLock, flags);
+      if (!pHddCtx->isLogpInProgress || (TRUE ==
+               vos_is_wlan_in_badState(VOS_MODULE_ID_HDD, NULL)))
+      {
+         //SSR isn't in progress OR last wlan reinit wasn't successful
+         pHddCtx->isLoadUnloadInProgress = WLAN_HDD_UNLOAD_IN_PROGRESS;
+         vos_set_load_unload_in_progress(VOS_MODULE_ID_VOSS, TRUE);
+         spin_unlock_irqrestore(&pVosWDCtx->wdLock, flags);
+      }
+      else
+      {
+         INIT_COMPLETION(pHddCtx->ssr_comp_var);
+
+         pHddCtx->isLoadUnloadInProgress = WLAN_HDD_UNLOAD_IN_PROGRESS;
+         vos_set_load_unload_in_progress(VOS_MODULE_ID_VOSS, TRUE);
+         spin_unlock_irqrestore(&pVosWDCtx->wdLock, flags);
+
          VOS_TRACE(VOS_MODULE_ID_HDD, VOS_TRACE_LEVEL_ERROR,
-              "%s:SSR  in Progress; block rmmod !!!", __func__);
+              "%s:SSR is in Progress; block rmmod !!!", __func__);
          rc = wait_for_completion_timeout(&pHddCtx->ssr_comp_var,
                                           msecs_to_jiffies(30000));
          if(!rc)
@@ -9721,9 +9750,10 @@ static void hdd_driver_exit(void)
          }
       }
 
+      /* We wait for active entry threads to exit from driver
+       * by waiting until rtnl_lock is available.
+       */
       rtnl_lock();
-      pHddCtx->isLoadUnloadInProgress = WLAN_HDD_UNLOAD_IN_PROGRESS;
-      vos_set_load_unload_in_progress(VOS_MODULE_ID_VOSS, TRUE);
       rtnl_unlock();
 
        /* Driver Need to send country code 00 in below condition
@@ -10560,6 +10590,31 @@ VOS_STATUS wlan_hdd_cancel_remain_on_channel(hdd_context_t *pHddCtx)
         pAdapterNode = pNext;
     }
     return VOS_STATUS_SUCCESS;
+}
+void hdd_nullify_netdev_ops(hdd_context_t *pHddCtx)
+{
+   VOS_STATUS status;
+   hdd_adapter_list_node_t *pAdapterNode = NULL, *pNext = NULL;
+   hdd_adapter_t      *pAdapter;
+
+   status = hdd_get_front_adapter ( pHddCtx, &pAdapterNode );
+   while ( NULL != pAdapterNode && VOS_STATUS_SUCCESS == status )
+   {
+      pAdapter = pAdapterNode->pAdapter;
+      if (NULL != pAdapter)
+      {
+          /* Disable TX on the interface, after this hard_start_xmit() will
+           * not be called on that interface
+           */
+          hddLog(VOS_TRACE_LEVEL_INFO, FL("Disabling queues"));
+          netif_tx_disable(pAdapter->dev);
+          /* Mark the interface status as "down" for outside world */
+          netif_carrier_off(pAdapter->dev);
+          pAdapter->dev->netdev_ops = &nullify_netdev_ops;
+      }
+      status = hdd_get_next_adapter ( pHddCtx, pAdapterNode, &pNext );
+      pAdapterNode = pNext;
+   }
 }
 
 //Register the module init/exit functions
